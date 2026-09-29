@@ -1,0 +1,239 @@
+saveDir_Fig5 = [MainDir filesep 'plot\Fig 5'];
+if ~exist(saveDir_Fig5,'dir')
+    mkdir(saveDir_Fig5)
+end
+
+
+%% Parameters for subsampling
+nNeuronsSub = 10;    % number of neurons to subsample each iteration
+nRepeats = 200;       % number of subsampling repetitions
+rangeSizeResp=0.04;
+
+%%
+for F=1:2
+        
+    %% Data structuring for linear regression
+    
+    for ani=1:Params.n_ani{F}
+        for pos=1:n_pos{F}(ani)
+            if ~isempty(data{F}{ani,pos})
+                VisStimTrials{F}{ani,pos}=data{F}{ani,pos}.Raw(:,:,2:9,:,:,:);
+                
+                VisStimSFCat{F}{ani,pos}=reshape(VisStimTrials{F}{ani,pos},size(VisStimTrials{F}{ani,pos},1),size(VisStimTrials{F}{ani,pos},2),size(VisStimTrials{F}{ani,pos},3)*size(VisStimTrials{F}{ani,pos},4),size(VisStimTrials{F}{ani,pos},5),size(VisStimTrials{F}{ani,pos},6));
+                
+                VisStimTrialsSFCat{F}{ani,pos}=squeeze(nanmean(VisStimSFCat{F}{ani,pos}(:,Params.StimONResponse,:,:,:),2));
+                VisStimTrialsSFCatMean{F}{ani,pos}=squeeze(nanmean(VisStimTrialsSFCat{F}{ani,pos},4));
+                                excitedAD{F}{ani,pos}=logical(CellStat{F}{ani,pos}.SigExcAD);
+
+                
+            end
+        end
+    end
+        VisStimAll{F}=cat(1,VisStimTrials{F}{:});
+    VisStimSFCatTrialMeanAll{F}=cat(1,VisStimTrialsSFCatMean{F}{:});
+    excited{F} = logical(cat(1,excitedAD{F}{:}));
+
+    
+    RangeThr{F}=false(size(VisStimSFCatTrialMeanAll{F},1),1);
+    for i=1:size(VisStimSFCatTrialMeanAll{F},1)
+        if range(VisStimSFCatTrialMeanAll{F}(i,:,1))>rangeSizeResp
+            RangeThr{F}(i)=true;
+        end
+    end
+    
+    ExcAnyDir{F}=VisStimSFCatTrialMeanAll{F}(excited{F}&RangeThr{F},:,:);
+    
+    
+    %% Data structuring for decoder
+    Vis=squeeze(nanmean(VisStimAll{F}(excited{F}&RangeThr{F},Params.StimONResponse,:,:,:,:),2));
+    
+    % concatenate trials from 2 SFTF
+    Vis2=permute(Vis,[1 2 4 5 3]);
+    MeanTime=reshape(Vis2, size(Vis2,1),size(Vis2,2),size(Vis2,3),[]);
+    
+    
+    % Assume: data is nNeurons × 8 × 2 × nReps
+    [nNeurons, nDir, nLaser, nReps] = size(MeanTime);
+    
+    % --- Split by laser condition ---
+    data_off{F} = squeeze(MeanTime(:,:,1,:));   % [nNeurons × 8 × nReps]
+    data_on{F} = squeeze(MeanTime(:,:,2,:));   % [nNeurons × 8 × nReps]
+    
+    % --- Reshape: collapse directions and repetitions into a single dimension ---
+    data_off{F}= reshape(permute(data_off{F}, [1 3 2]), nNeurons, nDir*nReps);
+    data_on{F}= reshape(permute(data_on{F}, [1 3 2]), nNeurons, nDir*nReps);
+    
+    % --- Create direction identity vector ---
+    dirIdentity = repelem(1:nDir, nReps);  % length = nDir*nReps
+    
+
+    %% Initialize arrays to store results
+    OFF_perf_rep = nan(nRepeats,1);
+    ON_perf_rep  = nan(nRepeats,1);
+    
+    ratioONOFF_perf{F}=nan(nRepeats,1);
+    slope_mean_rep{F} = nan(nRepeats,1);
+    intercept_mean_rep{F} =nan(nRepeats,1);
+    
+    
+    
+    for rep = 1:nRepeats
+        disp([Exp{F} ' rep # ' num2str(rep)])
+        
+        % Randomly sample neurons (with replacement)
+        if nNeuronsSub > nNeurons
+            warning('Requested more neurons than available — using all neurons.');
+            idxNeurons = 1:nNeurons;
+        else           
+            idxNeurons = randperm(nNeurons, nNeuronsSub);
+        end
+        
+        %% --- Decoder Laser OFF ---
+        X = data_off{F}(idxNeurons, :)';   % Trials x Neurons
+        y = dirIdentity(:);
+        
+        t = templateSVM('KernelFunction', 'linear', 'Standardize', true);
+        Mdl = fitcecoc(X, y, 'Learners', t, 'KFold', 5);
+        cvLoss = kfoldLoss(Mdl);
+        OFF_perf_rep(rep) = (1 - cvLoss) * 100;
+        
+        %% --- Decoder Laser ON ---
+        X = data_on{F}(idxNeurons, :)';   % Trials x Neurons
+        y = dirIdentity(:);
+        
+        t = templateSVM('KernelFunction', 'linear', 'Standardize', true);
+        Mdl = fitcecoc(X, y, 'Learners', t, 'KFold', 5);
+        cvLoss = kfoldLoss(Mdl);
+        ON_perf_rep(rep) = (1 - cvLoss) * 100;
+        
+        %% Linear regression
+        
+numNeuronsExc = numel(idxNeurons);
+numStimuliExc = size(ExcAnyDir{F}, 2);
+        
+        % Preallocate with NaN so skipped neurons are marked
+        interceptExc_rep = nan(numNeuronsExc,1);
+        slopeExc_rep = nan(numNeuronsExc,1);
+        cnt=1;
+        for n = idxNeurons
+            x = squeeze(ExcAnyDir{F}(n,:,1));  % Laser OFF
+            y = squeeze(ExcAnyDir{F}(n,:,2));  % Laser ON
+            
+            % Fit
+            p = polyfit(x, y, 1);
+            yfit = polyval(p, x);
+            
+            slopeExc_rep(cnt) = p(1);
+            interceptExc_rep(cnt) = p(2);
+            cnt=cnt+1;
+        end
+        
+        % --- Store mean decoding accuracy ratio ---
+        slope_mean_rep{F}(rep) = mean(slopeExc_rep);
+        intercept_mean_rep{F}(rep) = mean(interceptExc_rep);
+        
+    end
+    ratioONOFF_perf{F} = ON_perf_rep./OFF_perf_rep;
+
+end
+
+
+%% Stats
+Slope    = [slope_mean_rep{1}(:); slope_mean_rep{2}(:)];
+Decoding = [ratioONOFF_perf{1}(:); ratioONOFF_perf{2}(:)];
+Group    = [ones(numel(slope_mean_rep{1}),1); 2*ones(numel(slope_mean_rep{2}),1)];
+
+
+tbl = table(Decoding, Slope, categorical(Group), ...
+    'VariableNames', {'Decoding','Slope','Group'});
+
+lm = fitlm(tbl, 'Decoding ~ Slope*Group');
+anova(lm)
+
+
+%% Plot
+figure;
+
+subplot(1,2,1); hold on
+for F = [2 1]
+    x = slope_mean_rep{F};
+    y = ratioONOFF_perf{F};
+    
+    % Scatter plot
+    scatter(x, y, 3, Params.colors{F}, 'filled', 'MarkerFaceAlpha', 0.6);
+end
+
+for F = [2 1]
+        x = slope_mean_rep{F};
+    y = ratioONOFF_perf{F};
+ % Regression
+    pfit = polyfit(x, y, 1);
+    xfit = linspace(min(x), max(x), 100);
+    yfit = polyval(pfit, xfit);
+    plot(xfit, yfit, '-', 'Color', Params.colors{F}, 'LineWidth', 1.5);
+    
+[r{F}, pval{F}] = corr(x, y, 'Type', 'Spearman', 'Rows', 'complete');
+end
+ax = gca;
+ax.XColor = 'k';
+ax.YColor = 'k';
+set(gca,'FontSize',5,'LineWidth',0.6,'TickDir','out','TickLength',[0.01, 0.01]);
+
+% Axes lines
+xl = xlim; yl = ylim;
+plot([xl(1) xl(2)], [1 1], '--', 'Color', [0.5 0.5 0.5], 'LineWidth', 1);
+
+xlim([min(x) max(x)]); ylim([min(y) max(y)]);
+xlim([0.45 2.5]);
+
+xlabel('Ensemble mean slope');
+ylabel('Decoding Performance (ON/OFF)');
+
+title('Slope','Fontweight','normal');
+
+box off
+
+subplot(1,2,2); hold on
+for F = [2 1]
+    x = intercept_mean_rep{F};
+    y = ratioONOFF_perf{F};
+    
+    % Scatter plot
+    scatter(x, y, 3, Params.colors{F}, 'filled', 'MarkerFaceAlpha', 0.6);
+
+end
+
+for F=[2 1]  
+    x = intercept_mean_rep{F};
+    y = ratioONOFF_perf{F};
+    
+    % Regression
+    pfit = polyfit(x, y, 1);
+    xfit = linspace(min(x), max(x), 100);
+    yfit = polyval(pfit, xfit);
+    plot(xfit, yfit, '-', 'Color', Params.colors{F}, 'LineWidth', 1.5);
+    
+[r{F}, pval{F}] = corr(x, y, 'Type', 'Spearman', 'Rows', 'complete');
+end
+
+ax = gca;
+ax.XColor = 'k';
+ax.YColor = 'k';
+set(gca,'FontSize',5,'LineWidth',0.6,'TickDir','out','TickLength',[0.01, 0.01]);
+
+% Axes lines
+xl = xlim; yl = ylim;
+plot([xl(1) xl(2)], [1 1], '--', 'Color', [0.5 0.5 0.5], 'LineWidth', 1);
+
+xlim([min(x) max(x)]); ylim([min(y) max(y)]);
+
+xlabel('Ensemble mean offset');
+
+title('Offset','Fontweight','normal');
+box off
+
+set(gcf,'Units','centimeters','Position',[10 10 9 3.6]);
+
+PlotTitle=['_slope and offset vs decoding performance - n subsample = ' num2str(nNeuronsSub)];
+basePath = fullfile(saveDir_Fig5,[tv PlotTitle]);
+saveFigAll(gcf, basePath);
